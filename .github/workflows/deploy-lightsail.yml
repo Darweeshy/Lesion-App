@@ -1,0 +1,72 @@
+name: Build & Deploy to Lightsail
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  LIGHTSAIL_SERVICE: ${{ secrets.LIGHTSAIL_SERVICE }}
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Build the image on the runner and load it locally (needed for Lightsail push)
+      - name: Build Docker image (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          load: true
+          tags: backend:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Push image to Lightsail's internal registry for your service
+      - name: Push image to Lightsail registry
+        id: push
+        run: |
+          IMAGE_REF=$(aws lightsail push-container-image \
+            --service-name "$LIGHTSAIL_SERVICE" \
+            --label backend \
+            --image backend:latest \
+            --region "$AWS_REGION" \
+            --query 'image' --output text)
+          echo "IMAGE_REF=$IMAGE_REF"
+          echo "IMAGE_REF=$IMAGE_REF" >> $GITHUB_OUTPUT
+
+      # Deploy that image
+      - name: Deploy to Lightsail
+        run: |
+          aws lightsail create-container-service-deployment \
+            --service-name "$LIGHTSAIL_SERVICE" \
+            --region "$AWS_REGION" \
+            --containers '{
+              "backend": {
+                "image": "'"${{ steps.push.outputs.IMAGE_REF }}"'",
+                "ports": { "5000": "HTTP" },
+                "environment": {
+                  "FLASK_ENV": "production"
+                }
+              }
+            }' \
+            --public-endpoint '{
+              "containerName": "backend",
+              "containerPort": 5000,
+              "healthCheck": { "path": "/health", "successCodes": "200-399" }
+            }'
